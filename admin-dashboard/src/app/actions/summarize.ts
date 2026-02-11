@@ -3,6 +3,9 @@
 import OpenAI from 'openai';
 import { YoutubeTranscript } from 'youtube-transcript';
 import { Innertube, UniversalCache } from 'youtubei.js';
+import pool from '@/lib/db';
+import { getSession } from '@/lib/auth';
+import { revalidatePath } from 'next/cache';
 
 const openai = new OpenAI({
     apiKey: process.env.OPENAI_API_KEY,
@@ -10,13 +13,12 @@ const openai = new OpenAI({
 });
 
 // Helper function to fetch transcript with fallbacks
-async function fetchTranscript(videoId: string): Promise<string> {
+export async function fetchTranscript(videoId: string): Promise<string> {
     console.log(`Attempting to fetch transcript for: ${videoId}`);
 
     // Strategy 1: youtube-transcript (Fastest, Pure JS)
     try {
         console.log('Strategy 1: Trying youtube-transcript...');
-        // Try with 'en' explicitly, then default
         const transcriptItems = await YoutubeTranscript.fetchTranscript(videoId, { lang: 'en' });
         if (transcriptItems && transcriptItems.length > 0) {
             console.log('Strategy 1 Success!');
@@ -43,8 +45,7 @@ async function fetchTranscript(videoId: string): Promise<string> {
         console.warn(`Strategy 2 failed: ${e.message}`);
     }
 
-    // Strategy 3: Python yt-dlp (System command - Command Line)
-    // This is the most robust method for local development if python/yt-dlp is installed.
+    // Strategy 3: Python yt-dlp 
     try {
         console.log('Strategy 3: Trying python yt-dlp...');
         const { exec } = await import('child_process');
@@ -56,29 +57,20 @@ async function fetchTranscript(videoId: string): Promise<string> {
 
         const tempDir = os.tmpdir();
         const baseName = `yt-summary-${videoId}-${Date.now()}`;
-        // Output template for yt-dlp
         const outputPath = path.join(tempDir, baseName);
-
-        // Try to use 'python' or 'python3' 
         const pythonCmd = process.platform === 'win32' ? 'python' : 'python3';
-
-        // Command to download subs without video using installed yt-dlp module
         const cmd = `${pythonCmd} -m yt_dlp "https://www.youtube.com/watch?v=${videoId}" --skip-download --write-sub --write-auto-sub --sub-lang en,en-US --output "${outputPath}" --no-check-certificates --no-warnings --prefer-free-formats`;
 
         console.log(`Executing: ${cmd}`);
         await execAsync(cmd);
 
         const dirFiles = fs.readdirSync(tempDir);
-        // Look for any subtitle file (vtt preferred)
         const captionFile = dirFiles.find(f => f.startsWith(baseName) && (f.endsWith('.vtt') || f.endsWith('.ttml') || f.endsWith('.srv3')));
 
         if (captionFile) {
             const fullPath = path.join(tempDir, captionFile);
             let content = fs.readFileSync(fullPath, 'utf-8');
             try { fs.unlinkSync(fullPath); } catch (e) { /* ignore */ }
-
-            console.log('Strategy 3 Success!');
-            // Cleanup VTT
             return content
                 .replace(/WEBVTT/g, '')
                 .replace(/(\d{2}:\d{2}:\d{2}\.\d{3} --> \d{2}:\d{2}:\d{2}\.\d{3})/g, '')
@@ -91,56 +83,43 @@ async function fetchTranscript(videoId: string): Promise<string> {
         console.warn(`Strategy 3 failed: ${e.message}`);
     }
 
-    // Strategy 4: youtube-dl-exec (wrapper fallback)
+    throw new Error('Could not retrieve transcript from any source.');
+}
+
+export async function getVideoMetadata(videoId: string) {
     try {
-        console.log('Strategy 4: Trying youtube-dl-exec wrapper...');
-        const { default: youtubedl } = await import('youtube-dl-exec');
-        const fs = await import('fs');
-        const path = await import('path');
-        const os = await import('os');
-
-        const url = `https://www.youtube.com/watch?v=${videoId}`;
-        const tempDir = os.tmpdir();
-        const baseName = `yt-summary-wrapper-${videoId}-${Date.now()}`;
-        const outputPath = path.join(tempDir, baseName);
-
-        await youtubedl(url, {
-            skipDownload: true,
-            writeSub: true,
-            writeAutoSub: true,
-            subLang: 'en,en-US',
-            output: outputPath,
-            noCheckCertificates: true,
-            noWarnings: true,
-            preferFreeFormats: true,
-        });
-
-        const dirFiles = fs.readdirSync(tempDir);
-        const captionFile = dirFiles.find(f => f.startsWith(baseName) && (f.endsWith('.vtt') || f.endsWith('.ttml') || f.endsWith('.srv3')));
-
-        if (captionFile) {
-            const fullPath = path.join(tempDir, captionFile);
-            let content = fs.readFileSync(fullPath, 'utf-8');
-            try { fs.unlinkSync(fullPath); } catch (e) { /* ignore */ }
-
-            console.log('Strategy 4 Success!');
-            return content
-                .replace(/WEBVTT/g, '')
-                .replace(/(\d{2}:\d{2}:\d{2}\.\d{3} --> \d{2}:\d{2}:\d{2}\.\d{3})/g, '')
-                .replace(/(\d{2}:\d{2}\.\d{3} --> \d{2}:\d{2}\.\d{3})/g, '')
-                .replace(/<[^>]*>/g, '')
-                .replace(/\n+/g, ' ')
-                .trim();
-        }
-    } catch (e: any) {
-        console.warn(`Strategy 4 failed: ${e.message}`);
+        const youtube = await Innertube.create({ cache: new UniversalCache(false), generate_session_locally: true });
+        const info = await youtube.getInfo(videoId);
+        return {
+            title: info.basic_info.title || 'Unknown Title',
+            thumbnail_url: info.basic_info.thumbnail?.[0]?.url || ''
+        };
+    } catch (e) {
+        console.warn('Failed to fetch video metadata:', e);
+        return { title: 'Unknown Title', thumbnail_url: '' };
     }
-
-    throw new Error('Could not retrieve transcript from any source. The video might not have captions enabled, or serves are blocked.');
 }
 
 export async function generateStudyNotes(videoUrl: string) {
     try {
+        const session = await getSession();
+        if (!session || !session.user) {
+            return { success: false, error: 'Unauthorized. Please login.' };
+        }
+        const user = session.user;
+        console.log('Session User:', user);
+
+        // Verify user exists in DB to avoid foreign key violation
+        const dbClient = await pool.connect();
+        try {
+            const userCheck = await dbClient.query('SELECT id FROM users WHERE id = $1', [user.id]);
+            if (userCheck.rows.length === 0) {
+                return { success: false, error: 'User session is invalid or user no longer exists. Please logout and login again.' };
+            }
+        } finally {
+            dbClient.release();
+        }
+
         // 1. Extract Video ID
         let videoId = "";
         try {
@@ -155,89 +134,100 @@ export async function generateStudyNotes(videoUrl: string) {
             if (!videoId && /^[a-zA-Z0-9_-]{11}$/.test(videoUrl)) {
                 videoId = videoUrl;
             }
-        } catch (e) {
-            // parsing error
-        }
+        } catch (e) { }
 
         if (!videoId) {
-            // Regex fallback
             const match = videoUrl.match(/(?:v=|\/)([0-9A-Za-z_-]{11}).*/);
-            if (match) {
-                videoId = match[1];
-            }
+            if (match) videoId = match[1];
         }
 
         if (!videoId) {
-            return { success: false, error: 'Invalid YouTube URL. Please provide a valid link.' };
+            return { success: false, error: 'Invalid YouTube URL.' };
         }
 
-        // 2. Fetch Transcript
-        let transcriptText = '';
-        try {
-            transcriptText = await fetchTranscript(videoId);
-        } catch (err: any) {
-            console.error("Transcript Fetch Error:", err);
-            return { success: false, error: `Failed to fetch transcript: ${err.message}. Please ensure the video has captions.` };
-        }
+        // 2. Fetch Metadata & Transcript
+        const [metadata, transcriptText] = await Promise.all([
+            getVideoMetadata(videoId),
+            fetchTranscript(videoId)
+        ]);
 
         if (!transcriptText || transcriptText.trim().length === 0) {
             return { success: false, error: 'Transcript content is empty.' };
         }
 
-        // Truncate if too long (OpenAI token limits)
         const maxLength = 50000;
         const truncatedTranscript = transcriptText.length > maxLength
             ? transcriptText.substring(0, maxLength) + '...[truncated]'
             : transcriptText;
 
-        // 3. Generate Summary with OpenAI
-
-
+        // 3. Generate Structured Notes
         const systemPrompt = `
-    You are an expert AI Study Companion. Your goal is to create beautiful, well-structured, and highly educational study notes from the provided YouTube transcript.
+    You are an expert AI Study Companion. Your goal is to transform YouTube video transcripts into clean, professional, and highly organized study notes.
     
-    Output must be in valid Markdown format. Use emojis to make it engaging.
-    
-    Structure:
-    # 📚 [Video Title] 
+    Structure the output into the following JSON keys:
+    - "summary": A high-level executive summary of the video content.
+    - "study_notes": Comprehensive notes organized with clear headings. Include "Definitions", "Key Concepts", and "Detailed Explanations".
+    - "key_points": A bulleted list of the most important takeaways.
+    - "revision_notes": A "Quick Review" section with bite-sized facts and potential exam questions based on the content.
+    - "flashcards": An array of objects, each with "question" and "answer" keys. Create 5-10 cards based on the most important facts.
 
-    ## 🎯 Executive Summary
-    (A concise, high-level summary of the video's core message. 2-3 sentences.)
-
-    ## 🔑 Key Concepts
-    (The most important takeaways. Use bullet points.)
-
-    ## 📝 Detailed Study Notes
-    (Deep dive into the content. Use bolding for key terms. Break down complex topics into sub-sections if necessary.)
-
-    ## 💡 Actionable Insights / Real-World Application
-    (How can the user apply this knowledge?)
-
-    ## 🧠 Quiz Yourself
-    (3-5 multiple-choice or short-answer questions to test understanding. Put answers in a collapsible markdown section if possible, or at the very bottom.)
-
-    ---
-    *Generated by AI Study Companion*
+    Formatting Rules:
+    - Use clean Markdown for all content (bolding, lists, headings).
+    - Ensure the tone is academic yet accessible.
+    - If there are specific formulas, dates, or names, highlight them.
+    - Do NOT wrap the JSON in markdown code blocks. Return ONLY the raw JSON object.
     `;
 
         try {
             const completion = await openai.chat.completions.create({
-                model: "gpt-4o-mini",
+                model: "openai/gpt-4o-mini",
                 messages: [
                     { role: "system", content: systemPrompt },
-                    { role: "user", content: `Here is the transcript:\n\n${truncatedTranscript}` },
+                    { role: "user", content: `Transcript:\n${truncatedTranscript}` },
                 ],
                 temperature: 0.5,
+                response_format: { type: "json_object" }
             });
-            const studyNotes = completion.choices[0].message.content;
-            return { success: true, data: studyNotes };
+
+            const content = completion.choices[0].message.content;
+            if (!content) throw new Error("No content from OpenAI");
+
+            const parsedContent = JSON.parse(content);
+
+            // 4. Save to Database
+            const client = await pool.connect();
+            try {
+                await client.query(
+                    `INSERT INTO notes (user_id, video_url, video_title, thumbnail_url, summary, study_notes, key_points, revision_notes, flashcards, transcript)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+                    [
+                        user.id,
+                        videoUrl,
+                        metadata.title,
+                        metadata.thumbnail_url,
+                        parsedContent.summary,
+                        parsedContent.study_notes,
+                        parsedContent.key_points,
+                        parsedContent.revision_notes,
+                        JSON.stringify(parsedContent.flashcards || []),
+                        transcriptText
+                    ]
+                );
+                revalidatePath('/dashboard/notes-history');
+            } finally {
+                client.release();
+            }
+
+            return { success: true, data: parsedContent };
+
         } catch (openaiErr: any) {
-            console.error("OpenAI API Error:", openaiErr);
-            throw openaiErr; // rethrow to be caught by outer block
+            console.error("OpenAI/DB Error:", openaiErr);
+            const errorMessage = openaiErr.message || 'Failed to generate or save notes.';
+            return { success: false, error: errorMessage };
         }
 
     } catch (error) {
         console.error("General Error:", error);
-        return { success: false, error: 'An unexpected error occurred while generating notes.' };
+        return { success: false, error: 'An unexpected error occurred.' };
     }
 }

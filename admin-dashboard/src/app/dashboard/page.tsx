@@ -1,7 +1,7 @@
-
 import { getSession } from '@/lib/auth';
 import UserList from '@/components/UserList';
 import YouTubeSummarizer from '@/components/YouTubeSummarizer';
+import StatsOverview from '@/components/StatsOverview';
 
 export default async function DashboardPage() {
     const session = await getSession();
@@ -12,10 +12,17 @@ export default async function DashboardPage() {
     }
 
     return (
-        <div className="space-y-6">
-            <h2 className="text-2xl font-bold">Welcome, {user.email}</h2>
+        <div className="space-y-10">
+            <div className="flex items-center justify-between">
+                <div>
+                    <h2 className="text-3xl font-extrabold text-gray-900 tracking-tight">Welcome, {user.email}</h2>
+                    <p className="text-gray-500 mt-1">Here is what's happening today.</p>
+                </div>
+            </div>
 
-            {/* YouTube AI Tool Section - Available for everyone */}
+            <StatsOverview />
+
+            {/* YouTube AI Tool Section */}
             <div className="my-8">
                 <YouTubeSummarizer />
             </div>
