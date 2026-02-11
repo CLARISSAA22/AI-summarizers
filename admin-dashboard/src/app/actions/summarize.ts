@@ -226,8 +226,8 @@ export async function generateStudyNotes(videoUrl: string) {
             return { success: false, error: errorMessage };
         }
 
-    } catch (error) {
+    } catch (error: any) {
         console.error("General Error:", error);
-        return { success: false, error: 'An unexpected error occurred.' };
+        return { success: false, error: error.message || 'An unexpected error occurred.' };
     }
 }

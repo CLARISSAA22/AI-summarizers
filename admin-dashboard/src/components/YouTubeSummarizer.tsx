@@ -37,8 +37,8 @@ export default function YouTubeSummarizer() {
             } else {
                 setError(response.error || 'Failed to generate notes');
             }
-        } catch (err) {
-            setError('An unexpected error occurred');
+        } catch (err: any) {
+            setError(err.message || 'An unexpected error occurred');
         } finally {
             setLoading(false);
         }
