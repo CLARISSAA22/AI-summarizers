@@ -3,6 +3,7 @@
 import OpenAI from 'openai';
 import { YoutubeTranscript } from 'youtube-transcript';
 import { Innertube, UniversalCache } from 'youtubei.js';
+import { getSubtitles } from 'youtube-captions-scraper';
 import pool from '@/lib/db';
 import { getSession } from '@/lib/auth';
 import { revalidatePath } from 'next/cache';
@@ -16,6 +17,26 @@ const openai = new OpenAI({
 export async function fetchTranscript(videoId: string): Promise<string> {
     console.log(`Attempting to fetch transcript for: ${videoId}`);
 
+    // Strategy 0: DB Cache (Reuse existing transcripts for the same video)
+    try {
+        console.log('Strategy 0: Checking DB cache...');
+        const client = await pool.connect();
+        try {
+            const res = await client.query(
+                "SELECT transcript FROM notes WHERE video_url LIKE $1 AND transcript IS NOT NULL ORDER BY created_at DESC LIMIT 1",
+                [`%${videoId}%`]
+            );
+            if (res.rows.length > 0 && res.rows[0].transcript) {
+                console.log('Strategy 0 Success: Cached transcript found!');
+                return res.rows[0].transcript;
+            }
+        } finally {
+            client.release();
+        }
+    } catch (e: any) {
+        console.warn(`Strategy 0 (Cache) failed: ${e.message}`);
+    }
+
     // Strategy 1: youtube-transcript (Fastest, Pure JS)
     try {
         console.log('Strategy 1: Trying youtube-transcript...');
@@ -28,9 +49,24 @@ export async function fetchTranscript(videoId: string): Promise<string> {
         console.warn(`Strategy 1 failed: ${e.message}`);
     }
 
-    // Strategy 2: youtubei.js (Robust, simulates client)
+    // Strategy 2: youtube-captions-scraper (Alternative scraper)
     try {
-        console.log('Strategy 2: Trying youtubei.js...');
+        console.log('Strategy 2: Trying youtube-captions-scraper...');
+        const subtitles = await getSubtitles({
+            videoID: videoId,
+            lang: 'en'
+        });
+        if (subtitles && subtitles.length > 0) {
+            console.log('Strategy 2 Success!');
+            return subtitles.map((s: any) => s.text).join(' ');
+        }
+    } catch (e: any) {
+        console.warn(`Strategy 2 failed: ${e.message}`);
+    }
+
+    // Strategy 3: youtubei.js (Robust, simulates client)
+    try {
+        console.log('Strategy 3: Trying youtubei.js...');
         const youtube = await Innertube.create({ cache: new UniversalCache(false), generate_session_locally: true });
         const info = await youtube.getInfo(videoId);
         const transcriptData = await info.getTranscript();
@@ -38,16 +74,16 @@ export async function fetchTranscript(videoId: string): Promise<string> {
         if (transcriptData?.transcript?.content?.body?.initial_segments) {
             const segments = transcriptData.transcript.content.body.initial_segments;
             const text = segments.map((s: any) => s.snippet.text).join(' ');
-            console.log('Strategy 2 Success!');
+            console.log('Strategy 3 Success!');
             return text;
         }
     } catch (e: any) {
-        console.warn(`Strategy 2 failed: ${e.message}`);
+        console.warn(`Strategy 3 failed: ${e.message}`);
     }
 
-    // Strategy 3: Python yt-dlp 
+    // Strategy 4: Python yt-dlp (Fallback for local environments)
     try {
-        console.log('Strategy 3: Trying python yt-dlp...');
+        console.log('Strategy 4: Trying python yt-dlp...');
         const { exec } = await import('child_process');
         const util = await import('util');
         const execAsync = util.promisify(exec);
@@ -80,10 +116,10 @@ export async function fetchTranscript(videoId: string): Promise<string> {
                 .trim();
         }
     } catch (e: any) {
-        console.warn(`Strategy 3 failed: ${e.message}`);
+        console.warn(`Strategy 4 failed: ${e.message}`);
     }
 
-    throw new Error('Could not retrieve transcript from any source.');
+    throw new Error('Could not retrieve transcript from any source. This often happens if YouTube blocks the server IP. Please try again later or try a different video.');
 }
 
 export async function getVideoMetadata(videoId: string) {
